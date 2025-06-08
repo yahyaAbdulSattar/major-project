@@ -7,7 +7,7 @@ import { initializeWebSocketManager } from "./websocket";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   const httpServer = createServer(app);
-  
+
   // Initialize WebSocket manager
   initializeWebSocketManager(httpServer);
 
@@ -17,7 +17,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const p2pNetwork = getP2PNetwork();
       const networkStats = await storage.getLatestNetworkStats();
       const connectedPeers = await storage.getConnectedPeers();
-      
+
       res.json({
         isStarted: p2pNetwork.isStarted(),
         nodeId: p2pNetwork.getNodeId(),
@@ -35,14 +35,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/network/start", async (req, res) => {
     try {
       const p2pNetwork = getP2PNetwork();
-      
+
       if (p2pNetwork.isStarted()) {
         return res.status(400).json({ error: 'Network already started' });
       }
 
       await p2pNetwork.start();
-      
-      res.json({ 
+
+      res.json({
         message: 'P2P network started successfully',
         nodeId: p2pNetwork.getNodeId(),
         multiaddrs: p2pNetwork.getMultiaddrs(),
@@ -71,7 +71,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!multiaddr) {
         return res.status(400).json({ error: 'Multiaddr is required' });
       }
-      
+
       const p2pNetwork = getP2PNetwork();
       await p2pNetwork.connectToPeer(multiaddr);
       res.json({ message: 'Connection attempt initiated' });
@@ -107,7 +107,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const flCoordinator = getFLCoordinator();
       const latestRound = await storage.getLatestTrainingRound();
-      
+
       res.json({
         isTraining: flCoordinator.isTrainingActive(),
         currentRound: flCoordinator.getCurrentRound(),
@@ -124,7 +124,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const p2pNetwork = getP2PNetwork();
       const flCoordinator = getFLCoordinator();
-      
+
       if (!p2pNetwork.isStarted()) {
         return res.status(400).json({ error: 'P2P network not started' });
       }
@@ -144,8 +144,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       await flCoordinator.startTrainingRound(connectedPeers);
-      
-      res.json({ 
+
+      res.json({
         message: 'Training started successfully',
         roundNumber: flCoordinator.getCurrentRound(),
         participatingPeers: connectedPeers,
@@ -171,15 +171,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const id = parseInt(req.params.id);
       const round = await storage.getTrainingRound(id);
-      
+
       if (!round) {
         return res.status(404).json({ error: 'Training round not found' });
       }
-      
+
       res.json(round);
     } catch (error) {
       console.error('Failed to get training round:', error);
       res.status(500).json({ error: 'Failed to get training round' });
+    }
+  });
+
+  // Training simulation endpoint for testing
+  app.post("/api/training/simulate", async (req, res) => {
+    try {
+      const flCoordinator = getFLCoordinator();
+      const p2pNetwork = getP2PNetwork();
+
+      if (flCoordinator.isTrainingActive()) {
+        return res.status(400).json({ error: 'Training already in progress' });
+      }
+
+      // Initialize model if not already done
+      await flCoordinator.initializeModel();
+
+      // Simulate training with local node
+      const nodeId = p2pNetwork.getNodeId() || 'simulation-node';
+      await flCoordinator.startTrainingRound([nodeId]);
+
+      res.json({
+        message: 'Training simulation started successfully',
+        roundNumber: flCoordinator.getCurrentRound(),
+        participatingPeers: [nodeId],
+        mode: 'simulation'
+      });
+    } catch (error: any) {
+      console.error('Failed to start training simulation:', error);
+      res.status(500).json({ error: error.message });
     }
   });
 
@@ -220,12 +249,121 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/model/initialize", async (req, res) => {
     try {
+      const { config } = req.body;
       const flCoordinator = getFLCoordinator();
-      await flCoordinator.initializeModel();
-      res.json({ message: 'Model initialized successfully' });
+
+      if (config) {
+        // Initialize with custom config
+        await flCoordinator.initializeModelWithConfig(config);
+      } else {
+        // Initialize with default config
+        await flCoordinator.initializeModel();
+      }
+
+      res.json({
+        message: 'Model initialized successfully',
+        config: config || flCoordinator.getDefaultConfig()
+      });
     } catch (error: any) {
       console.error('Failed to initialize model:', error);
       res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Data upload endpoint
+  app.post("/api/data/upload", async (req, res) => {
+    try {
+      // This would be implemented with proper file upload handling
+      // For now, return a mock response
+      const { modelType, modelId } = req.body;
+
+      // Simulate data processing
+      const preview = {
+        samples: 1000,
+        features: modelType === 'image_classification' ? 'Image data' : 'Numerical features',
+        labels: modelType === 'regression' ? 'Continuous values' : 'Categorical labels',
+        shape: modelType === 'image_classification' ? [1000, 28, 28, 1] : [1000, 10]
+      };
+
+      await storage.createNetworkActivity({
+        type: 'data_uploaded',
+        peerId: null,
+        message: `Training data uploaded for ${modelId}`,
+        timestamp: new Date(),
+        metadata: { modelType, modelId, samples: preview.samples },
+      });
+
+      res.json({
+        message: 'Data uploaded successfully',
+        preview,
+        processed: true
+      });
+    } catch (error: any) {
+      console.error('Failed to upload data:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // Federated training endpoints
+  app.post("/api/training/federated/start", async (req, res) => {
+    try {
+      const p2pNetwork = getP2PNetwork();
+      const flCoordinator = getFLCoordinator();
+
+      if (!p2pNetwork.isStarted()) {
+        return res.status(400).json({ error: 'P2P network not started' });
+      }
+
+      if (flCoordinator.isTrainingActive()) {
+        return res.status(400).json({ error: 'Training already in progress' });
+      }
+
+      const connectedPeers = p2pNetwork.getConnectedPeers();
+      const { requireMinimumPeers = false, minimumPeers = 2 } = req.body;
+
+      // Check if we have enough peers for federated learning
+      if (requireMinimumPeers && connectedPeers.length < minimumPeers) {
+        return res.status(400).json({
+          error: `Need at least ${minimumPeers} peers for federated training. Currently connected: ${connectedPeers.length}`
+        });
+      }
+
+      let participatingPeers = connectedPeers;
+
+      // Allow single-node training for testing
+      if (connectedPeers.length === 0) {
+        participatingPeers = [p2pNetwork.getNodeId() || 'local-node'];
+      }
+
+      await flCoordinator.startTrainingRound(participatingPeers);
+
+      res.json({
+        message: 'Federated training started successfully',
+        roundNumber: flCoordinator.getCurrentRound(),
+        participatingPeers,
+        mode: connectedPeers.length > 0 ? 'federated' : 'local'
+      });
+    } catch (error: any) {
+      console.error('Failed to start federated training:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/training/federated/status", async (req, res) => {
+    try {
+      const flCoordinator = getFLCoordinator();
+      const p2pNetwork = getP2PNetwork();
+
+      res.json({
+        isActive: flCoordinator.isTrainingActive(),
+        currentRound: flCoordinator.getCurrentRound(),
+        participatingPeers: flCoordinator.getParticipatingPeers(),
+        connectedPeers: p2pNetwork.getConnectedPeers().length,
+        canStartTraining: !flCoordinator.isTrainingActive() && p2pNetwork.isStarted()
+      });
+    } catch (error) {
+      console.error('Failed to get federated training status:', error);
+      res.status(500).json({ error: 'Failed to get federated training status' });
     }
   });
 

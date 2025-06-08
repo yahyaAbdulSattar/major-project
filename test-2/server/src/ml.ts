@@ -26,6 +26,7 @@ export class FederatedLearningCoordinator extends EventEmitter {
   private isTraining: boolean = false;
   private currentRound: number = 0;
   private participatingPeers: Set<string> = new Set();
+  private currentModelType: string = 'default';
 
   constructor(config: ModelConfig) {
     super();
@@ -33,38 +34,183 @@ export class FederatedLearningCoordinator extends EventEmitter {
   }
 
   async initializeModel(): Promise<void> {
+    return this.initializeModelWithConfig(this.config);
+  }
+
+  async initializeModelWithConfig(config: ModelConfig): Promise<void> {
     try {
-      // Create a simple neural network for demonstration
-      this.model = tf.sequential({
-        layers: [
-          tf.layers.dense({
-            inputShape: this.config.inputShape,
-            units: 64,
-            activation: 'relu',
-          }),
-          tf.layers.dropout({ rate: 0.2 }),
-          tf.layers.dense({
-            units: 32,
-            activation: 'relu',
-          }),
-          tf.layers.dense({
-            units: this.config.numClasses,
-            activation: 'softmax',
-          }),
-        ],
-      });
+      this.config = config;
+      this.currentModelType = this.determineModelType(config);
+      
+      // Create model based on type
+      this.model = await this.createModelForType(config);
 
-      this.model.compile({
-        optimizer: tf.train.adam(this.config.learningRate),
-        loss: 'categoricalCrossentropy',
-        metrics: ['accuracy'],
-      });
+      // Compile model with appropriate loss function and metrics
+      const compilationConfig = this.getCompilationConfig(config);
+      this.model.compile(compilationConfig);
 
-      console.log('Model initialized successfully');
-      this.emit('modelInitialized');
+      console.log(`Model initialized successfully for type: ${this.currentModelType}`);
+      this.emit('modelInitialized', { type: this.currentModelType, config });
     } catch (error) {
       console.error('Failed to initialize model:', error);
       throw error;
+    }
+  }
+
+  private determineModelType(config: ModelConfig): string {
+    if (config.inputShape.length === 3 && config.inputShape[2] > 1) {
+      return 'image_classification';
+    } else if (config.inputShape.length === 2) {
+      return 'time_series';
+    } else if (config.numClasses && config.numClasses > 1) {
+      return 'classification';
+    } else {
+      return 'regression';
+    }
+  }
+
+  private async createModelForType(config: ModelConfig): Promise<tf.LayersModel> {
+    const type = this.determineModelType(config);
+    
+    switch (type) {
+      case 'image_classification':
+        return this.createCNNModel(config);
+      case 'time_series':
+        return this.createRNNModel(config);
+      case 'classification':
+        return this.createDenseModel(config, 'classification');
+      case 'regression':
+        return this.createDenseModel(config, 'regression');
+      default:
+        return this.createDenseModel(config, 'classification');
+    }
+  }
+
+  private createCNNModel(config: ModelConfig): tf.LayersModel {
+    const model = tf.sequential();
+    
+    // Convolutional layers
+    model.add(tf.layers.conv2d({
+      inputShape: config.inputShape,
+      filters: 32,
+      kernelSize: 3,
+      activation: 'relu',
+    }));
+    model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
+    
+    model.add(tf.layers.conv2d({
+      filters: 64,
+      kernelSize: 3,
+      activation: 'relu',
+    }));
+    model.add(tf.layers.maxPooling2d({ poolSize: 2 }));
+    
+    model.add(tf.layers.conv2d({
+      filters: 64,
+      kernelSize: 3,
+      activation: 'relu',
+    }));
+    
+    // Dense layers
+    model.add(tf.layers.flatten());
+    model.add(tf.layers.dense({ units: 64, activation: 'relu' }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+    model.add(tf.layers.dense({ 
+      units: config.numClasses || 10, 
+      activation: 'softmax' 
+    }));
+    
+    return model;
+  }
+
+  private createRNNModel(config: ModelConfig): tf.LayersModel {
+    const model = tf.sequential();
+    
+    model.add(tf.layers.lstm({
+      inputShape: config.inputShape,
+      units: 50,
+      returnSequences: true,
+    }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+    
+    model.add(tf.layers.lstm({
+      units: 50,
+      returnSequences: false,
+    }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+    
+    model.add(tf.layers.dense({ 
+      units: config.outputShape[0],
+      activation: config.numClasses && config.numClasses > 1 ? 'softmax' : 'linear'
+    }));
+    
+    return model;
+  }
+
+  private createDenseModel(config: ModelConfig, type: 'classification' | 'regression'): tf.LayersModel {
+    const model = tf.sequential();
+    
+    // Input layer
+    model.add(tf.layers.dense({
+      inputShape: config.inputShape,
+      units: 128,
+      activation: 'relu',
+    }));
+    model.add(tf.layers.dropout({ rate: 0.3 }));
+    
+    // Hidden layers
+    model.add(tf.layers.dense({
+      units: 64,
+      activation: 'relu',
+    }));
+    model.add(tf.layers.dropout({ rate: 0.2 }));
+    
+    model.add(tf.layers.dense({
+      units: 32,
+      activation: 'relu',
+    }));
+    
+    // Output layer
+    const outputUnits = type === 'regression' ? config.outputShape[0] : (config.numClasses || 2);
+    const outputActivation = type === 'regression' ? 'linear' : 'softmax';
+    
+    model.add(tf.layers.dense({
+      units: outputUnits,
+      activation: outputActivation,
+    }));
+    
+    return model;
+  }
+
+  private getCompilationConfig(config: ModelConfig): any {
+    const type = this.determineModelType(config);
+    
+    switch (type) {
+      case 'regression':
+        return {
+          optimizer: tf.train.adam(config.learningRate),
+          loss: 'meanSquaredError',
+          metrics: ['mae'],
+        };
+      case 'image_classification':
+      case 'classification':
+        return {
+          optimizer: tf.train.adam(config.learningRate),
+          loss: 'categoricalCrossentropy',
+          metrics: ['accuracy'],
+        };
+      case 'time_series':
+        return {
+          optimizer: tf.train.adam(config.learningRate),
+          loss: config.numClasses && config.numClasses > 1 ? 'categoricalCrossentropy' : 'meanSquaredError',
+          metrics: config.numClasses && config.numClasses > 1 ? ['accuracy'] : ['mae'],
+        };
+      default:
+        return {
+          optimizer: tf.train.adam(config.learningRate),
+          loss: 'categoricalCrossentropy',
+          metrics: ['accuracy'],
+        };
     }
   }
 
@@ -309,6 +455,18 @@ export class FederatedLearningCoordinator extends EventEmitter {
 
   getParticipatingPeers(): string[] {
     return Array.from(this.participatingPeers);
+  }
+
+  getDefaultConfig(): ModelConfig {
+    return this.config;
+  }
+
+  getCurrentModelType(): string {
+    return this.currentModelType;
+  }
+
+  updateConfig(newConfig: Partial<ModelConfig>): void {
+    this.config = { ...this.config, ...newConfig };
   }
 }
 

@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --turbopack",
+    "prepare:datasets": "node scripts/prepare-datasets.js",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"

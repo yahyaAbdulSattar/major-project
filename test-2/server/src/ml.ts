@@ -27,6 +27,7 @@ export class FederatedLearningCoordinator extends EventEmitter {
   private currentRound: number = 0;
   private participatingPeers: Set<string> = new Set();
   private currentModelType: string = 'default';
+  private trainingData: TrainingData | null = null;
 
   constructor(config: ModelConfig) {
     super();
@@ -214,6 +215,11 @@ export class FederatedLearningCoordinator extends EventEmitter {
     }
   }
 
+  async setTrainingData(data: TrainingData): Promise<void> {
+    this.trainingData = data;
+    console.log(`Training data set with ${data.features.length} samples`);
+  }
+
   async startTrainingRound(participatingPeerIds: string[]): Promise<void> {
     if (this.isTraining) {
       throw new Error('Training is already in progress');
@@ -221,6 +227,10 @@ export class FederatedLearningCoordinator extends EventEmitter {
 
     if (!this.model) {
       throw new Error('Model not initialized');
+    }
+
+    if (!this.trainingData) {
+      throw new Error('No training data available. Please upload data first.');
     }
 
     this.isTraining = true;
@@ -256,16 +266,11 @@ export class FederatedLearningCoordinator extends EventEmitter {
         roundId: trainingRound.id,
       });
 
-      // Generate mock training data for demonstration
-      const trainingData = this.generateMockTrainingData();
+      // Perform local training with actual data
+      const history = await this.trainModel(this.trainingData);
       
-      // Perform local training
-      const history = await this.trainModel(trainingData);
-      
-      // Simulate peer parameter collection and aggregation
-      setTimeout(async () => {
-        await this.completeTrainingRound(trainingRound.id, history);
-      }, 5000);
+      // Complete the training round
+      await this.completeTrainingRound(trainingRound.id, history);
 
     } catch (error) {
       console.error('Failed to start training round:', error);
@@ -348,45 +353,93 @@ export class FederatedLearningCoordinator extends EventEmitter {
     }
   }
 
-  async aggregateModelWeights(peerWeights: ModelWeights[]): Promise<void> {
-    if (!this.model || peerWeights.length === 0) {
-      return;
+  async aggregateModelWeights(peerWeights: any[], includeSelf: boolean = true): Promise<void> {
+    if (!this.model) {
+      throw new Error('Model not initialized');
     }
 
     try {
-      // Simple federated averaging
-      const modelWeights = this.model.getWeights();
+      console.log(`Starting federated averaging with ${peerWeights.length} peer weights`);
+      
+      // Get current model weights
+      const currentWeights = this.model.getWeights();
+      let allWeights = [...peerWeights];
+      
+      // Include self weights if specified
+      if (includeSelf) {
+        const selfWeights = this.getModelWeights();
+        if (selfWeights) {
+          allWeights.push(selfWeights);
+        }
+      }
+
+      if (allWeights.length === 0) {
+        console.log('No weights to aggregate');
+        return;
+      }
+
+      console.log(`Aggregating weights from ${allWeights.length} participants`);
+
       const aggregatedWeights: tf.Tensor[] = [];
 
-      for (let i = 0; i < modelWeights.length; i++) {
-        const currentWeight = modelWeights[i];
-        const shape = currentWeight.shape;
+      for (let layerIndex = 0; layerIndex < currentWeights.length; layerIndex++) {
+        const currentLayerShape = currentWeights[layerIndex].shape;
         
-        // Initialize with zeros
-        let aggregated = tf.zeros(shape);
-        
-        // Add all peer weights
-        for (const peerWeight of peerWeights) {
-          if (i < peerWeight.weights.length) {
-            const peerTensor = tf.tensor(peerWeight.weights[i], shape);
-            aggregated = aggregated.add(peerTensor);
-            peerTensor.dispose();
+        // Initialize aggregation tensor with zeros
+        let aggregatedLayer = tf.zeros(currentLayerShape);
+        let validWeightCount = 0;
+
+        // Sum all peer weights for this layer
+        for (const peerWeight of allWeights) {
+          if (peerWeight && peerWeight.length > layerIndex) {
+            try {
+              const layerData = peerWeight[layerIndex];
+              if (layerData && layerData.data && layerData.shape) {
+                const peerTensor = tf.tensor(layerData.data, layerData.shape);
+                
+                // Ensure shapes match
+                if (JSON.stringify(peerTensor.shape) === JSON.stringify(currentLayerShape)) {
+                  aggregatedLayer = aggregatedLayer.add(peerTensor);
+                  validWeightCount++;
+                }
+                peerTensor.dispose();
+              }
+            } catch (error) {
+              console.warn(`Skipping invalid weight from peer at layer ${layerIndex}:`, error);
+            }
           }
         }
-        
-        // Average the weights
-        aggregated = aggregated.div(tf.scalar(peerWeights.length));
-        aggregatedWeights.push(aggregated);
+
+        if (validWeightCount > 0) {
+          // Average the weights
+          aggregatedLayer = aggregatedLayer.div(tf.scalar(validWeightCount));
+          console.log(`Layer ${layerIndex}: Averaged ${validWeightCount} weight sets`);
+        } else {
+          console.warn(`No valid weights found for layer ${layerIndex}, keeping current weights`);
+          aggregatedLayer = currentWeights[layerIndex].clone();
+        }
+
+        aggregatedWeights.push(aggregatedLayer);
       }
 
       // Update model with aggregated weights
       this.model.setWeights(aggregatedWeights);
       
-      // Clean up
+      // Clean up tensors
       aggregatedWeights.forEach(tensor => tensor.dispose());
       
-      console.log('Model weights aggregated successfully');
-      this.emit('weightsAggregated');
+      console.log(`✅ Federated averaging completed successfully`);
+      
+      // Log the aggregation event
+      await storage.createNetworkActivity({
+        type: 'weights_aggregated',
+        peerId: null,
+        message: `Model weights aggregated from ${allWeights.length} participants`,
+        timestamp: new Date(),
+        metadata: { participantCount: allWeights.length, includedSelf: includeSelf },
+      });
+
+      this.emit('weightsAggregated', { participantCount: allWeights.length });
       
     } catch (error) {
       console.error('Failed to aggregate model weights:', error);
@@ -434,15 +487,75 @@ export class FederatedLearningCoordinator extends EventEmitter {
     const labels: number[] = [];
 
     for (let i = 0; i < numSamples; i++) {
-      // Generate random features based on input shape
-      const feature = this.config.inputShape.map(() => Math.random());
+      // Generate features based on model type
+      let feature: number[];
+      
+      if (this.currentModelType === 'image_classification') {
+        // Generate image-like data (flattened 28x28 for MNIST-like)
+        feature = Array(784).fill(0).map(() => Math.random());
+      } else if (this.currentModelType === 'regression') {
+        // Generate continuous features
+        feature = this.config.inputShape.map(() => Math.random() * 100);
+      } else {
+        // Generate classification features
+        feature = this.config.inputShape.map(() => Math.random() * 10);
+      }
+      
       features.push(feature);
       
-      // Generate random label
-      labels.push(Math.floor(Math.random() * this.config.numClasses));
+      // Generate label based on model type
+      if (this.currentModelType === 'regression') {
+        // For regression, generate continuous target
+        labels.push(Math.random() * 100);
+      } else {
+        // For classification, generate class labels
+        labels.push(Math.floor(Math.random() * this.config.numClasses));
+      }
     }
 
     return { features, labels };
+  }
+
+  async processUserData(data: any, modelType: string): Promise<TrainingData> {
+    // Process user-uploaded data based on model type
+    console.log(`Processing user data for model type: ${modelType}`);
+    
+    if (!data || !data.features || !data.labels) {
+      console.log('No user data provided, generating mock data');
+      return this.generateMockTrainingData();
+    }
+
+    try {
+      // Validate and process the data
+      const features = Array.isArray(data.features) ? data.features : [];
+      const labels = Array.isArray(data.labels) ? data.labels : [];
+      
+      if (features.length !== labels.length) {
+        throw new Error('Features and labels must have the same length');
+      }
+
+      // Normalize features if needed
+      const normalizedFeatures = features.map((feature: any[]) => {
+        if (!Array.isArray(feature)) return [feature];
+        return feature.map(f => typeof f === 'number' ? f : parseFloat(f) || 0);
+      });
+
+      const processedLabels = labels.map((label: any) => {
+        if (modelType === 'regression') {
+          return typeof label === 'number' ? label : parseFloat(label) || 0;
+        } else {
+          return typeof label === 'number' ? label : parseInt(label) || 0;
+        }
+      });
+
+      return {
+        features: normalizedFeatures,
+        labels: processedLabels
+      };
+    } catch (error) {
+      console.error('Error processing user data:', error);
+      return this.generateMockTrainingData();
+    }
   }
 
   isTrainingActive(): boolean {

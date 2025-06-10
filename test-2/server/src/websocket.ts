@@ -34,7 +34,7 @@ export class WebSocketManager {
         try {
           const p2pNetwork = getP2PNetwork();
           const flCoordinator = getFLCoordinator();
-          
+
           if (!p2pNetwork.isStarted()) {
             socket.emit('error', { message: 'P2P network not started' });
             return;
@@ -42,7 +42,7 @@ export class WebSocketManager {
 
           const connectedPeers = p2pNetwork.getConnectedPeers();
           await flCoordinator.startTrainingRound(connectedPeers);
-          
+
         } catch (error: any) {
           console.error('Failed to start training:', error);
           socket.emit('error', { message: error.message });
@@ -59,7 +59,7 @@ export class WebSocketManager {
           const networkStats = await storage.getLatestNetworkStats();
           const recentActivity = await storage.getRecentNetworkActivity(10);
           const connectedPeers = await storage.getConnectedPeers();
-          
+
           socket.emit('network-status', {
             stats: networkStats,
             activity: recentActivity,
@@ -92,7 +92,7 @@ export class WebSocketManager {
     try {
       const p2pNetwork = getP2PNetwork();
       const flCoordinator = getFLCoordinator();
-      
+
       // Send P2P network status
       socket.emit('p2p-status', {
         isStarted: p2pNetwork.isStarted(),
@@ -140,12 +140,12 @@ export class WebSocketManager {
 
     p2pNetwork.on('peerConnected', async (data) => {
       this.broadcast('p2p-peer-connected', data);
-      
+
       // Send updated peer list
       try {
         const connectedPeers = await storage.getConnectedPeers();
         this.broadcast('connected-peers', connectedPeers);
-        
+
         const networkStats = await storage.getLatestNetworkStats();
         if (networkStats) {
           this.broadcast('network-stats', networkStats);
@@ -157,12 +157,12 @@ export class WebSocketManager {
 
     p2pNetwork.on('peerDisconnected', async (data) => {
       this.broadcast('p2p-peer-disconnected', data);
-      
+
       // Send updated peer list
       try {
         const connectedPeers = await storage.getConnectedPeers();
         this.broadcast('connected-peers', connectedPeers);
-        
+
         const networkStats = await storage.getLatestNetworkStats();
         if (networkStats) {
           this.broadcast('network-stats', networkStats);
@@ -175,33 +175,56 @@ export class WebSocketManager {
 
   private setupMLEventForwarding(): void {
     const flCoordinator = getFLCoordinator();
+    const p2pNetwork = getP2PNetwork();
 
-    flCoordinator.on('modelInitialized', () => {
-      this.broadcast('ml-model-initialized');
-    });
-
+    // Forward ML events to connected clients
     flCoordinator.on('trainingStarted', (data) => {
-      this.broadcast('ml-training-started', data);
+      console.log('📡 Broadcasting training started event');
+      this.io.emit('training:started', data);
     });
 
     flCoordinator.on('trainingProgress', (data) => {
-      this.broadcast('ml-training-progress', data);
+      this.io.emit('training:progress', data);
     });
 
     flCoordinator.on('trainingCompleted', async (data) => {
-      this.broadcast('ml-training-completed', data);
-      
-      // Send updated training history
-      try {
-        const trainingHistory = await storage.getRecentTrainingRounds(20);
-        this.broadcast('training-history', trainingHistory);
-      } catch (error) {
-        console.error('Failed to send training history:', error);
+      console.log('📡 Broadcasting training completed event');
+      this.io.emit('training:completed', data);
+
+      // Automatically start weight aggregation if we have peers
+      const connectedPeers = p2pNetwork.getConnectedPeers();
+      if (connectedPeers.length > 0) {
+        console.log('🔄 Starting automatic weight aggregation...');
+        try {
+          const peerWeights = await p2pNetwork.requestWeightsFromPeers();
+          if (peerWeights.length > 0) {
+            await flCoordinator.aggregateModelWeights(peerWeights, true);
+          }
+        } catch (error) {
+          console.error('Failed to aggregate weights automatically:', error);
+        }
       }
     });
 
-    flCoordinator.on('weightsAggregated', () => {
-      this.broadcast('ml-weights-aggregated');
+    flCoordinator.on('weightsAggregated', (data) => {
+      console.log('📡 Broadcasting weights aggregated event');
+      this.io.emit('weights:aggregated', data);
+    });
+
+    flCoordinator.on('modelInitialized', (data) => {
+      this.io.emit('model:initialized', data);
+    });
+
+    // Forward P2P federated learning events
+    p2pNetwork.on('weightsReceived', (data) => {
+      this.io.emit('federated:weights-received', {
+        peerId: data.peerId,
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    p2pNetwork.on('trainingCoordination', (data) => {
+      this.io.emit('federated:coordination', data);
     });
   }
 

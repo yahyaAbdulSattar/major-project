@@ -34,7 +34,10 @@ export class P2PNetwork extends EventEmitter {
       port: parseInt(process.env.P2P_PORT || "9000"),
       enableMdns: process.env.P2P_ENABLE_MDNS !== "false",
       bootstrapPeers:
-        process.env.P2P_BOOTSTRAP_PEERS?.split(",").filter(Boolean) || [],
+        process.env.P2P_BOOTSTRAP_PEERS?.split(",").filter(Boolean) || [
+          // Add some default bootstrap peers for cross-network discovery
+          // These would be public relay nodes or known bootstrap peers
+        ],
       ...config,
     };
   }
@@ -47,6 +50,11 @@ export class P2PNetwork extends EventEmitter {
         addresses: {
           listen: [
             `/ip4/0.0.0.0/tcp/${this.config.port}`,
+            `/ip6/::/tcp/${this.config.port}`,
+          ],
+          announce: [
+            // Announce external addresses if available
+            ...(process.env.EXTERNAL_IP ? [`/ip4/${process.env.EXTERNAL_IP}/tcp/${this.config.port}`] : []),
           ],
         },
         transports: [tcp()],
@@ -54,6 +62,8 @@ export class P2PNetwork extends EventEmitter {
         streamMuxers: [yamux()],
         connectionManager: {
           maxConnections: 100,
+          minConnections: 1,
+          autoRelay: true, // Enable automatic relay discovery
         },
         peerDiscovery: [
           ...(this.config.enableMdns
@@ -82,6 +92,7 @@ export class P2PNetwork extends EventEmitter {
 
       // Set up event listeners
       this.setupEventListeners();
+      this.setupFederatedLearningHandlers();
 
       await this.node.start();
 
@@ -206,9 +217,23 @@ export class P2PNetwork extends EventEmitter {
         `🔄 Attempting to connect to peer: ${peerId.slice(0, 12)}...`,
       );
 
-      // Try well-known addresses for local network
+      // Try well-known addresses for local and external networks
       const commonPorts = [9000, 9001, 9002];
-      const localIPs = ["127.0.0.1", "192.168.0.132"];
+      const localIPs = ["127.0.0.1", "192.168.0.132", "192.168.1.132"];
+
+      // Also try any stored peer addresses
+      const storedPeer = await storage.getPeer(peerId);
+      if (storedPeer?.multiaddr) {
+        try {
+          const addrString = `${storedPeer.multiaddr}/p2p/${peerId}`;
+          console.log(`🎯 Trying stored address: ${addrString}`);
+          await this.node.dial(multiaddr(addrString));
+          console.log(`✅ Successfully connected via stored address!`);
+          return;
+        } catch (err: any) {
+          // Continue to other methods
+        }
+      }
 
       for (const ip of localIPs) {
         for (const port of commonPorts) {
@@ -446,11 +471,27 @@ export class P2PNetwork extends EventEmitter {
       console.error("Failed to update network stats:", error);
     }
   }
+
+  private setupFederatedLearningHandlers(): void {
+    // Example: Register a handler for exchanging model weights
+    this.registerMessageHandler("/federated-learning/weights", (weights, peerId) => {
+      console.log(`Received weights from peer ${peerId.slice(0, 12)}...`, weights);
+      // Handle the received weights (e.g., store them for aggregation)
+      this.emit("weightsReceived", { peerId, weights });
+    });
+
+    // Example: Register a handler for requesting model weights
+    this.registerMessageHandler("/federated-learning/request-weights", (data, peerId) => {
+      console.log(`Received request for weights from peer ${peerId.slice(0, 12)}...`);
+      // Respond with the current model weights
+      this.emit("weightsRequested", { peerId });
+    });
+  }
 }
 
 let p2pNetwork: P2PNetwork | null = null;
 
-export function getP2PNetwork(): P2PNetwork {
+export function getP2PNetwork(): any {
   if (!p2pNetwork) {
     p2pNetwork = new P2PNetwork();
   }

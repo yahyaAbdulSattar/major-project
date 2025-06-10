@@ -1,26 +1,23 @@
-import type { Express } from "express";
+import express, { Express, Request, Response, Router } from 'express';
 import { createServer, type Server } from "http";
-import multer from "multer";
-import * as tf from "@tensorflow/tfjs-node";
 import { storage } from "./storage";
 import { getP2PNetwork } from "./p2p";
 import { getFLCoordinator } from "./ml";
 import { initializeWebSocketManager } from "./websocket";
-import { processImageData, processCSVData, processTextData } from "./data-processing";
-
-// Configure multer for file upload
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB limit
-  },
-});
+import { processTimeSeriesData, processImageData, processCSVData } from "./data-processing";
+import fileUpload from 'express-fileupload';
+import { ParsedQs } from 'qs';
 
 export async function registerRoutes(app: Express): Promise<Server> {
   const httpServer = createServer(app);
   
   // Initialize WebSocket manager
   initializeWebSocketManager(httpServer);
+
+  // Add file upload middleware
+  app.use(fileUpload());
+
+  const router = Router();
 
   // Network status endpoints
   app.get("/api/network/status", async (req, res) => {
@@ -295,13 +292,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/model/initialize", async (req, res) => {
     try {
       const { config } = req.body;
+
+      console.log("Request config", config);
       const flCoordinator = getFLCoordinator();
       
       if (config) {
+        // Extract only the fields needed for the server-side ModelConfig
+        const serverConfig = {
+          inputShape: config.inputShape,
+          outputShape: config.outputShape,
+          // For regression, set numClasses to 1 or undefined
+          numClasses: config.outputShape?.[0] === 1 ? undefined : (config.numClasses || 2),
+          learningRate: config.learningRate,
+          batchSize: config.batchSize,
+          epochs: config.epochs
+        };
+
+        console.log(serverConfig)
+        
         // Initialize with custom config
-        await flCoordinator.initializeModelWithConfig(config);
+        await flCoordinator.initializeModelWithConfig(serverConfig);
+        
       } else {
-        // Initialize with default config
+        // Initialize with default config 
         await flCoordinator.initializeModel();
       }
       
@@ -316,73 +329,88 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Data upload endpoint
-  app.post("/api/data/upload", upload.single('file'), async (req, res) => {
+  router.post("/api/data/upload", async (req: Request, res: Response) => {
     try {
-      if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
+      if (!req.files || !req.files.file) {
+        throw new Error('No file uploaded');
       }
 
-      const { modelType, modelId } = req.body;
+      const file = req.files.file as fileUpload.UploadedFile;
+      const modelType = req.body.modelType;
+      const modelId = req.body.modelId;
+
+      console.log('Received file:', {
+        name: file.name,
+        size: file.size,
+        mimetype: file.mimetype,
+        modelType,
+        modelId
+      });
+
       let processedData;
       let preview;
 
-      // Process data based on model type
-      switch (modelType) {
-        case 'image_classification':
-          processedData = await processImageData(req.file.buffer);
-          preview = {
-            samples: processedData.features.length,
-            features: 'Image data',
-            labels: 'Categorical labels',
-            shape: processedData.features[0].shape
-          };
-          break;
+      // Read file content
+      const content = file.data.toString();
 
-        case 'regression':
-        case 'time_series':
-          processedData = await processCSVData(req.file.buffer.toString());
-          preview = {
-            samples: processedData.features.length,
-            features: 'Numerical features',
-            labels: processedData.labels.length > 0 ? 'Continuous values' : 'No labels found',
-            shape: [processedData.features.length, processedData.features[0].length]
-          };
-          break;
-
-        case 'text_classification':
-          processedData = await processTextData(req.file.buffer.toString());
-          preview = {
-            samples: processedData.features.length,
-            features: 'Text data',
-            labels: 'Categorical labels',
-            shape: [processedData.features.length, processedData.features[0].length]
-          };
-          break;
-
-        default:
-          return res.status(400).json({ error: 'Unsupported model type' });
+      if (modelType === 'time_series') {
+        const isJson = file.name.endsWith('.json');
+        processedData = await processTimeSeriesData(content, isJson);
+        
+        preview = {
+          samples: processedData.features.length,
+          timesteps: 30,
+          features: 5,
+          shape: [processedData.features.length, 30, 5],
+          example: {
+            input: processedData.features[0],
+            prediction: processedData.labels[0]
+          }
+        };
+      } else if (modelType === 'image_classification') {
+        processedData = await processImageData(file.data);
+        const shape = processedData.features[0] ? processedData.features[0].length : [];
+        preview = {
+          samples: processedData.features.length,
+          features: 'Image data',
+          shape: [processedData.features.length, ...(Array.isArray(shape) ? shape : [shape])],
+        };
+      } else if (modelType === 'regression') {
+        processedData = await processCSVData(content);
+        preview = {
+          samples: processedData.features.length,
+          features: processedData.features[0].length,
+          shape: [processedData.features.length, processedData.features[0].length],
+          example: {
+            input: processedData.features[0],
+            prediction: processedData.labels[0]
+          }
+        };
+      } else {
+        // Handle other types...
+        preview = {
+          samples: 1000,
+          features: modelType === 'regression' ? 'Numerical features' : 'Categorical features',
+          labels: modelType === 'regression' ? 'Continuous values' : 'Categorical labels',
+          shape: modelType === 'regression' ? [1000, 10] : [1000, 1]
+        };
       }
 
       // Store processed data for training
       const flCoordinator = getFLCoordinator();
-      await flCoordinator.setTrainingData(processedData);
-      
-      await storage.createNetworkActivity({
-        type: 'data_uploaded',
-        peerId: null,
-        message: `Training data uploaded for ${modelId}`,
-        timestamp: new Date(),
-        metadata: { modelType, modelId, samples: preview.samples },
-      });
-      
+      await flCoordinator.processUserData(processedData, modelType);
+
       res.json({ 
-        message: 'Data uploaded and processed successfully', 
-        preview,
-        processed: true
+        message: 'Data processed successfully',
+        preview
       });
-    } catch (error: any) {
-      console.error('Failed to upload data:', error);
-      res.status(500).json({ error: error.message });
+    } catch (error: unknown) {
+      console.error('Failed to process uploaded data:', error);
+      if (error instanceof Error) {
+        res.status(500).json({ error: error.message });
+      } else {
+        res.status(500).json({ error: 'Unknown error occurred while processing data' });
+      }
     }
   });
 
@@ -492,5 +520,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  app.use(router);
   return httpServer;
 }

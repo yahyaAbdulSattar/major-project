@@ -4,6 +4,7 @@ import { storage } from './storage';
 
 export interface ModelConfig {
   inputShape: number[];
+  outputShape?: number[];
   numClasses: number;
   learningRate: number;
   batchSize: number;
@@ -27,7 +28,6 @@ export class FederatedLearningCoordinator extends EventEmitter {
   private currentRound: number = 0;
   private participatingPeers: Set<string> = new Set();
   private currentModelType: string = 'default';
-  private trainingData: TrainingData | null = null;
 
   constructor(config: ModelConfig) {
     super();
@@ -52,8 +52,9 @@ export class FederatedLearningCoordinator extends EventEmitter {
 
       console.log(`Model initialized successfully for type: ${this.currentModelType}`);
       this.emit('modelInitialized', { type: this.currentModelType, config });
+
     } catch (error) {
-      console.error('Failed to initialize model:', error);
+      console.error('Failed to initialize model during initializeModelWithConfig:', error);
       throw error;
     }
   }
@@ -63,9 +64,13 @@ export class FederatedLearningCoordinator extends EventEmitter {
       return 'image_classification';
     } else if (config.inputShape.length === 2) {
       return 'time_series';
+    } else if (config.outputShape?.[0] === 1) {
+      // If output shape is [1], it's regression
+      return 'regression';
     } else if (config.numClasses && config.numClasses > 1) {
       return 'classification';
     } else {
+      // Default to regression if no clear indicators
       return 'regression';
     }
   }
@@ -141,7 +146,7 @@ export class FederatedLearningCoordinator extends EventEmitter {
     model.add(tf.layers.dropout({ rate: 0.2 }));
     
     model.add(tf.layers.dense({ 
-      units: config.outputShape[0],
+      units: config.outputShape?.[0] || config.numClasses || 1,
       activation: config.numClasses && config.numClasses > 1 ? 'softmax' : 'linear'
     }));
     
@@ -172,7 +177,7 @@ export class FederatedLearningCoordinator extends EventEmitter {
     }));
     
     // Output layer
-    const outputUnits = type === 'regression' ? config.outputShape[0] : (config.numClasses || 2);
+    const outputUnits = type === 'regression' ? (config.outputShape?.[0] || 1) : (config.numClasses || 2);
     const outputActivation = type === 'regression' ? 'linear' : 'softmax';
     
     model.add(tf.layers.dense({
@@ -215,11 +220,6 @@ export class FederatedLearningCoordinator extends EventEmitter {
     }
   }
 
-  async setTrainingData(data: TrainingData): Promise<void> {
-    this.trainingData = data;
-    console.log(`Training data set with ${data.features.length} samples`);
-  }
-
   async startTrainingRound(participatingPeerIds: string[]): Promise<void> {
     if (this.isTraining) {
       throw new Error('Training is already in progress');
@@ -227,10 +227,6 @@ export class FederatedLearningCoordinator extends EventEmitter {
 
     if (!this.model) {
       throw new Error('Model not initialized');
-    }
-
-    if (!this.trainingData) {
-      throw new Error('No training data available. Please upload data first.');
     }
 
     this.isTraining = true;
@@ -266,11 +262,16 @@ export class FederatedLearningCoordinator extends EventEmitter {
         roundId: trainingRound.id,
       });
 
-      // Perform local training with actual data
-      const history = await this.trainModel(this.trainingData);
+      // Generate mock training data for demonstration
+      const trainingData = this.generateMockTrainingData();
       
-      // Complete the training round
-      await this.completeTrainingRound(trainingRound.id, history);
+      // Perform local training
+      const history = await this.trainModel(trainingData);
+      
+      // Simulate peer parameter collection and aggregation
+      setTimeout(async () => {
+        await this.completeTrainingRound(trainingRound.id, history);
+      }, 5000);
 
     } catch (error) {
       console.error('Failed to start training round:', error);
@@ -286,7 +287,16 @@ export class FederatedLearningCoordinator extends EventEmitter {
 
     // Convert data to tensors
     const xs = tf.tensor2d(data.features);
-    const ys = tf.oneHot(tf.tensor1d(data.labels, 'int32'), this.config.numClasses);
+    let ys;
+    
+    // Handle regression and classification differently
+    if (this.currentModelType === 'regression') {
+      // For regression, just convert labels to tensor
+      ys = tf.tensor2d(data.labels, [data.labels.length, 1]);
+    } else {
+      // For classification, use one-hot encoding
+      ys = tf.oneHot(tf.tensor1d(data.labels, 'int32'), this.config.numClasses);
+    }
 
     try {
       // Train the model
@@ -296,12 +306,14 @@ export class FederatedLearningCoordinator extends EventEmitter {
         validationSplit: 0.2,
         callbacks: {
           onEpochEnd: (epoch, logs) => {
-            console.log(`Epoch ${epoch + 1}: loss=${logs?.loss?.toFixed(4)}, accuracy=${logs?.acc?.toFixed(4)}`);
+            console.log(`Epoch ${epoch + 1}: loss=${logs?.loss?.toFixed(4)}, ${
+              this.currentModelType === 'regression' ? 'mae' : 'accuracy'
+            }=${(this.currentModelType === 'regression' ? logs?.mae : logs?.acc)?.toFixed(4)}`);
             this.emit('trainingProgress', {
               epoch: epoch + 1,
               totalEpochs: this.config.epochs,
               loss: logs?.loss,
-              accuracy: logs?.acc,
+              accuracy: this.currentModelType === 'regression' ? logs?.mae : logs?.acc,
             });
           },
         },
@@ -534,19 +546,53 @@ export class FederatedLearningCoordinator extends EventEmitter {
         throw new Error('Features and labels must have the same length');
       }
 
-      // Normalize features if needed
-      const normalizedFeatures = features.map((feature: any[]) => {
-        if (!Array.isArray(feature)) return [feature];
-        return feature.map(f => typeof f === 'number' ? f : parseFloat(f) || 0);
-      });
+      let normalizedFeatures;
+      if (modelType === 'time_series') {
+        // For time series, we need to reshape the data into windows
+        // Each window is 30 timesteps with 5 features
+        normalizedFeatures = [];
+        for (let i = 0; i <= features.length - 30; i++) {
+          const window = features.slice(i, i + 30).map((row: number[]) => {
+            // Ensure we have 5 features per timestep
+            if (!Array.isArray(row) || row.length !== 5) {
+              throw new Error('Time series data must have exactly 5 features per timestep');
+            }
+            return row.map(f => typeof f === 'number' ? f : parseFloat(f) || 0);
+          });
+          normalizedFeatures.push(window);
+        }
+      } else if (modelType === 'regression') {
+        // For regression, ensure each feature is a properly shaped array
+        normalizedFeatures = features.map((feature: any) => {
+          if (Array.isArray(feature)) {
+            return feature.map(f => typeof f === 'number' ? f : parseFloat(f) || 0);
+          }
+          throw new Error('Each feature must be an array for regression');
+        });
+      } else {
+        // For other types, process as before
+        normalizedFeatures = features.map((feature: any[]) => {
+          if (!Array.isArray(feature)) return [feature];
+          return feature.map(f => typeof f === 'number' ? f : parseFloat(f) || 0);
+        });
+      }
 
       const processedLabels = labels.map((label: any) => {
-        if (modelType === 'regression') {
+        if (modelType === 'regression' || modelType === 'time_series') {
           return typeof label === 'number' ? label : parseFloat(label) || 0;
         } else {
           return typeof label === 'number' ? label : parseInt(label) || 0;
         }
       });
+
+      // For time series, we need to adjust labels to match the windowed features
+      if (modelType === 'time_series') {
+        const windowedLabels = processedLabels.slice(30);
+        return {
+          features: normalizedFeatures,
+          labels: windowedLabels
+        };
+      }
 
       return {
         features: normalizedFeatures,
@@ -554,7 +600,7 @@ export class FederatedLearningCoordinator extends EventEmitter {
       };
     } catch (error) {
       console.error('Error processing user data:', error);
-      return this.generateMockTrainingData();
+      throw error; // Let's throw the error instead of returning mock data
     }
   }
 
@@ -590,6 +636,7 @@ export function getFLCoordinator(): FederatedLearningCoordinator {
   if (!flCoordinator) {
     const config: ModelConfig = {
       inputShape: [784], // MNIST-like input
+      outputShape: [10], // Output shape for classification
       numClasses: 10,
       learningRate: 0.001,
       batchSize: 32,

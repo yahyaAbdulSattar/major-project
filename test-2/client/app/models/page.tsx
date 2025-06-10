@@ -98,8 +98,17 @@ export default function ModelsPage() {
 
   // Mutations
   const initializeModelMutation = useMutation({
-    mutationFn: (config: ModelConfig) => 
-      apiRequest('POST', '/api/model/initialize', { config }),
+    mutationFn: (model: ModelConfig) => 
+      apiRequest('POST', '/api/model/initialize', { 
+        config: {
+          inputShape: model.inputShape,
+          outputShape: model.outputShape,
+          numClasses: model.numClasses,
+          learningRate: model.learningRate,
+          batchSize: model.batchSize,
+          epochs: model.epochs
+        }
+      }),
     onSuccess: () => {
       toast({
         title: "Model Initialized",
@@ -115,8 +124,19 @@ export default function ModelsPage() {
   });
 
   const uploadDataMutation = useMutation({
-    mutationFn: (formData: FormData) => 
-      apiRequest('POST', '/api/data/upload', formData, true),
+    mutationFn: async (formData: FormData) => {
+      const response = await fetch(`${API_URL}/api/data/upload`, {
+        method: 'POST',
+        body: formData, // Don't set Content-Type header - browser will set it with boundary
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to upload data');
+      }
+      
+      return response.json();
+    },
     onSuccess: (data) => {
       setDataPreview(data.preview);
       if (currentSession) {
@@ -236,6 +256,8 @@ export default function ModelsPage() {
     if (file && selectedModel) {
       setUploadedData(file);
 
+      console.log(file, selectedModel)
+
       const formData = new FormData();
       formData.append('file', file);
       formData.append('modelType', selectedModel.type);
@@ -255,10 +277,12 @@ export default function ModelsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           config: {
-            ...selectedModel.config,
-            epochs: trainingConfig.epochs,
+            inputShape: selectedModel.inputShape,
+            outputShape: selectedModel.outputShape,
+            numClasses: selectedModel.numClasses,
+            learningRate: trainingConfig.learningRate,
             batchSize: trainingConfig.batchSize,
-            learningRate: trainingConfig.learningRate
+            epochs: trainingConfig.epochs
           }
         })
       });
@@ -300,10 +324,12 @@ export default function ModelsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           config: {
-            ...selectedModel.config,
-            epochs: trainingConfig.epochs,
+            inputShape: selectedModel.inputShape,
+            outputShape: selectedModel.outputShape,
+            numClasses: selectedModel.numClasses,
+            learningRate: trainingConfig.learningRate,
             batchSize: trainingConfig.batchSize,
-            learningRate: trainingConfig.learningRate
+            epochs: trainingConfig.epochs
           }
         })
       });

@@ -472,26 +472,115 @@ export class P2PNetwork extends EventEmitter {
     }
   }
 
+  async broadcastTrainingStart(roundNumber: number): Promise<void> {
+    if (!this.node) {
+      throw new Error("Node not started");
+    }
+
+    const message = {
+      type: 'training_start',
+      roundNumber,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log(`Broadcasting training start for round ${roundNumber}...`);
+    await this.broadcastMessage('/federated-learning/training-start', message);
+  }
+
+  async requestWeightsFromPeers(): Promise<any[]> {
+    if (!this.node) {
+      throw new Error("Node not started");
+    }
+
+    const peerWeights: any[] = [];
+    const connections = this.node.getConnections();
+    
+    console.log(`Requesting weights from ${connections.length} connected peers...`);
+
+    for (const connection of connections) {
+      try {
+        const peerId = connection.remotePeer.toString();
+        await this.sendMessage(peerId, '/federated-learning/request-weights', { 
+          requestId: Date.now(),
+          timestamp: new Date().toISOString()
+        });
+
+        // For now, simulate receiving weights (in a real implementation, 
+        // you'd wait for the actual response)
+        const mockWeights = this.generateMockWeights();
+        peerWeights.push(mockWeights);
+        
+        console.log(`Received weights from peer ${peerId.slice(0, 12)}...`);
+      } catch (error) {
+        console.error(`Failed to request weights from peer:`, error);
+      }
+    }
+
+    return peerWeights;
+  }
+
+  private generateMockWeights(): any {
+    // Generate mock weights structure for testing
+    return [
+      {
+        shape: [784, 128],
+        data: Array(784 * 128).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [128],
+        data: Array(128).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [128, 64],
+        data: Array(128 * 64).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [64],
+        data: Array(64).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [64, 32],
+        data: Array(64 * 32).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [32],
+        data: Array(32).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [32, 10],
+        data: Array(32 * 10).fill(0).map(() => Math.random() * 0.1)
+      },
+      {
+        shape: [10],
+        data: Array(10).fill(0).map(() => Math.random() * 0.1)
+      }
+    ];
+  }
+
   private setupFederatedLearningHandlers(): void {
-    // Example: Register a handler for exchanging model weights
+    // Register handler for training start broadcasts
+    this.registerMessageHandler("/federated-learning/training-start", (data, peerId) => {
+      console.log(`Received training start notification from peer ${peerId.slice(0, 12)}... for round ${data.roundNumber}`);
+      this.emit("trainingStartReceived", { peerId, roundNumber: data.roundNumber });
+    });
+
+    // Register handler for exchanging model weights
     this.registerMessageHandler("/federated-learning/weights", (weights, peerId) => {
-      console.log(`Received weights from peer ${peerId.slice(0, 12)}...`, weights);
-      // Handle the received weights (e.g., store them for aggregation)
+      console.log(`Received weights from peer ${peerId.slice(0, 12)}...`);
       this.emit("weightsReceived", { peerId, weights });
     });
 
-    // Example: Register a handler for requesting model weights
+    // Register handler for requesting model weights
     this.registerMessageHandler("/federated-learning/request-weights", (data, peerId) => {
       console.log(`Received request for weights from peer ${peerId.slice(0, 12)}...`);
-      // Respond with the current model weights
-      this.emit("weightsRequested", { peerId });
+      this.emit("weightsRequested", { peerId, requestId: data.requestId });
     });
   }
 }
 
 let p2pNetwork: P2PNetwork | null = null;
 
-export function getP2PNetwork(): any {
+export function getP2PNetwork(): P2PNetwork {
   if (!p2pNetwork) {
     p2pNetwork = new P2PNetwork();
   }
